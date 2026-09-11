@@ -929,3 +929,8 @@ h1 > span {
   .photo-actions { bottom: 170px; }
   .toast { bottom: 225px; }
 }
+
+.upload-menu { width: 360px !important; max-width: calc(100vw - 32px) !important; display: grid; gap: 16px; color: #574d49; background: #fffaf0; animation: none !important; }
+.upload-menu .batch-upload { background: #527e96; color: white; }
+.upload-menu .batch-help { font-size: 12px; line-height: 1.6; color: #746d65; }
+.upload-menu button { min-height: 44px; }

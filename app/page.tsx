@@ -51,6 +51,11 @@ type Draft = { source: string; image: HTMLImageElement; crop: Crop };
 export default function Home() {
   const conversion = useRef<AbortController | null>(null);
   const [processingHeic, setProcessingHeic] = useState(false);
+  const batchInput = useRef<HTMLInputElement>(null);
+  const batchLock = useRef(false);
+  const [uploadMenu, setUploadMenu] = useState(false);
+  const [batchProgress, setBatchProgress] = useState('');
+  const [batchError, setBatchError] = useState('');
   const swapHandler = useRef<(from: number, to: number) => Promise<void>>(async () => {});
   const exchanging = useRef(false);
   const pendingSave = useRef(false);
@@ -96,6 +101,7 @@ export default function Home() {
         host.current,
         (index) => {
           setSelected(index);
+          if (index >= 0) setChoosing(false);
         },
         setNotice,
         (from, to) => swapHandler.current(from, to),
@@ -299,6 +305,65 @@ export default function Home() {
       if (token === fileRequest.current) { setBusy(false); setProcessingHeic(false); }
     }
   }
+  async function uploadBatch(files: File[]) {
+    if (!files.length || batchLock.current || pendingSave.current || busy || !api.current) return;
+    const slots = memories.map((m, i) => m.empty ? i : -1).filter(i => i >= 0);
+    setBatchError('');
+    if (files.length > slots.length) {
+      setBatchError(`还有 ${slots.length} 个空相框，请最多选择 ${slots.length} 张照片。`);
+      return;
+    }
+    const invalid = files.find(file => file.size > 50 * 1024 * 1024 ||
+      !(['image/jpeg', 'image/png', 'image/webp'].includes(file.type.toLowerCase()) || /\.(jpe?g|png|webp|heic|heif)$/i.test(file.name) || /^image\/hei[cf]/i.test(file.type)));
+    if (invalid) { setBatchError(`“${invalid.name}”不符合要求：请选择单张不超过 50 MB 的 JPG、PNG、WebP 或 HEIC/HEIF。`); return; }
+    // Shuffle only empty positions. Existing photos are never included.
+    for (let i = slots.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [slots[i], slots[j]] = [slots[j], slots[i]];
+    }
+    batchLock.current = true;
+    setBusy(true);
+    const prepared: { slot: number; memory: Memory; blob: Blob }[] = [];
+    let committed = false;
+    try {
+      for (let i = 0; i < files.length; i++) {
+        setBatchProgress(`正在准备 ${i + 1} / ${files.length} 张…`);
+        const file = files[i];
+        const heic = /\.(heic|heif)$/i.test(file.name) || /^image\/hei[cf]/i.test(file.type);
+        const blob = heic ? await convertHeic(file, new AbortController().signal) : file;
+        const source = URL.createObjectURL(blob);
+        try {
+          const image = await loadPhoto(source);
+          const canvas = document.createElement('canvas');
+          drawCrop(canvas, image, initialCrop);
+          prepared.push({ slot: slots[i], blob, memory: {
+            source, preview: canvas.toDataURL('image/jpeg', 0.92), crop: { ...initialCrop }, custom: true, empty: false,
+          } });
+        } catch (error) { URL.revokeObjectURL(source); throw error; }
+      }
+      setBatchProgress('正在保存相片…');
+      await commitPhotos(async () => prepared.map(({slot, memory, blob}) => ({
+        slot, source: blob, preview: memory.preview, crop: memory.crop, empty: false,
+      })));
+      for (const {memory} of prepared) {
+        urls.current.add(memory.source);
+      }
+      committed = true;
+      setMemories(list => list.map((memory, i) => prepared.find(p => p.slot === i)?.memory ?? memory));
+      for (const {slot, memory} of prepared) await api.current?.setPhoto(slot, memory.preview);
+      api.current?.reset();
+      setUploadMenu(false);
+      setNotice(`已将 ${prepared.length} 张照片随机挂入空相框，并保存到本机。`);
+      play('hang');
+    } catch (error) {
+      setBatchError(committed ? '照片已保存，但画面更新未完成，请重新打开小工具。' : `${(error as Error).message} 本次批量照片均未挂上。`);
+    } finally {
+      if (!committed) for (const p of prepared) URL.revokeObjectURL(p.memory.source);
+      batchLock.current = false;
+      setBusy(false);
+      setBatchProgress('');
+    }
+  }
   async function save() {
     if (!draft || selected < 0 || !api.current || pendingSave.current) return;
     setBusy(true);
@@ -458,19 +523,17 @@ export default function Home() {
       <footer className="bottom">
         <div className="toolbar">
           <Button
-            disabled={!ready}
+            disabled={!ready || busy}
             className="upload"
             onClick={() => {
-              if (selected >= 0) {
-                void openEditor();
-              } else {
-                setChoosing(true);
-                play('select');
-              }
+              setChoosing(false);
+              setBatchError('');
+              setUploadMenu(true);
+              play('select');
             }}
           >
             <Plus />
-            {selected >= 0 ? '挂在这个位置' : '挂相片'}
+            挂相片
           </Button>
           <Button
             disabled={!ready}
@@ -534,6 +597,33 @@ export default function Home() {
           <span>For personal, non-commercial use only.</span>
         </p>
       </footer>
+      <Dialog open={uploadMenu} onOpenChange={open => { if (!batchLock.current) setUploadMenu(open); }}>
+        <DialogContent className="upload-menu" showCloseButton={!busy}>
+          <DialogHeader>
+            <DialogTitle>挂上你的相片</DialogTitle>
+            <DialogDescription>
+              还有 {memories.filter(m => m.empty).length} 个空相框。批量上传会随机填入空位，已有照片保持原位。
+            </DialogDescription>
+          </DialogHeader>
+          <Button disabled={busy} onClick={() => {
+            setUploadMenu(false);
+            api.current?.reset();
+            setChoosing(true);
+          }}>选位置挂一张</Button>
+          <Button className="batch-upload" disabled={busy || !memories.some(m => m.empty)} onClick={() => batchInput.current?.click()}>
+            <ImagePlus />批量上传
+          </Button>
+          {!memories.some(m => m.empty) && <p>相框已挂满，可以点击照片更换。</p>}
+          <p className="batch-help">JPG、PNG、WebP、HEIC · 单张最大 50 MB · 最多选择剩余空位数量的照片</p>
+          {batchProgress && <p role="status">{batchProgress}</p>}
+          {batchError && <p className="editor-error" role="alert">{batchError}</p>}
+          <input ref={batchInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/heic,image/heif,.jpg,.jpeg,.png,.webp,.heic,.heif" hidden onChange={event => {
+            const files = Array.from(event.target.files ?? []);
+            event.target.value = '';
+            void uploadBatch(files);
+          }} />
+        </DialogContent>
+      </Dialog>
       {choosing && (
         <aside className="position-picker" aria-label="选择相片位置">
           <div className="picker-heading">
